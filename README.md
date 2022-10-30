@@ -1,4 +1,4 @@
-# Bounding Boxes to world coordinates
+# Bounding Boxes to World Coordinates
 
 ## Description
 This is the repository for the ROS package bounding_boxes_to_world_coordinates. The package makes use of a robot's kinect sensor and its localization to estimate the detected object's world coordinates (x and y). 
