@@ -1,8 +1,8 @@
 string id
 
-int32 image_x
-int32 image_y
-int32 w
-int32 h
+int32 upper_left_corner_x
+int32 upper_left_corner_y
+int32 bounding_box_width
+int32 bounding_box_height
 float64 world_x
 float64 world_y

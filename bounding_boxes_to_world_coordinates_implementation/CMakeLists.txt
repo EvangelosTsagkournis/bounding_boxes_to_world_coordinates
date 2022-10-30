@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.0.2)
 project(bounding_boxes_to_world_coordinates_implementation)
 
 ## Compile as C++11, supported in ROS Kinetic and newer
-# add_compile_options(-std=c++11)
+add_compile_options(-std=c++11)
 
 ## Find catkin macros and libraries
 ## if COMPONENTS list like find_package(catkin REQUIRED COMPONENTS xyz)
@@ -10,11 +10,14 @@ project(bounding_boxes_to_world_coordinates_implementation)
 find_package(catkin REQUIRED COMPONENTS
   cv_bridge
   image_transport
-  message_filters
   roscpp
   sensor_msgs
   std_msgs
+  message_filters
+  bounding_boxes_to_world_coordinates_msgs
 )
+
+find_package(OpenCV REQUIRED)
 
 ## System dependencies are found with CMake's conventions
 # find_package(Boost REQUIRED COMPONENTS system)
@@ -106,10 +109,16 @@ find_package(catkin REQUIRED COMPONENTS
 ## CATKIN_DEPENDS: catkin_packages dependent projects also need
 ## DEPENDS: system dependencies of this project that dependent projects also need
 catkin_package(
-#  INCLUDE_DIRS include
-#  LIBRARIES bounding_boxes_to_world_coordinates_implementation
-#  CATKIN_DEPENDS cv_bridge image_transport message_filters roscpp sensor_msgs std_msgs
-#  DEPENDS system_lib
+  INCLUDE_DIRS include
+  CATKIN_DEPENDS 
+    cv_bridge
+    image_transport
+    roscpp
+    sensor_msgs
+    std_msgs
+    message_filters
+    bounding_boxes_to_world_coordinates_msgs
+  #DEPENDS system_lib
 )
 
 ###########
@@ -119,8 +128,9 @@ catkin_package(
 ## Specify additional locations of header files
 ## Your package locations should be listed before other locations
 include_directories(
-# include
+  include
   ${catkin_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
 )
 
 ## Declare a C++ library
@@ -137,6 +147,8 @@ include_directories(
 ## With catkin_make all packages are built within a single CMake context
 ## The recommended prefix ensures that target names across packages don't collide
 # add_executable(${PROJECT_NAME}_node src/bounding_boxes_to_world_coordinates_implementation_node.cpp)
+add_executable(bounding_boxes_to_world_coordinates_node src/bounding_boxes_to_world_coordinates_node.cpp)
+add_executable(bounding_box_publisher_node src/bounding_box_publisher_node.cpp)
 
 ## Rename C++ executable without prefix
 ## The above recommended prefix causes long target names, the following renames the
@@ -147,11 +159,21 @@ include_directories(
 ## Add cmake target dependencies of the executable
 ## same as for the library above
 # add_dependencies(${PROJECT_NAME}_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+add_dependencies(bounding_boxes_to_world_coordinates_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+add_dependencies(bounding_box_publisher_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
 ## Specify libraries to link a library or executable target against
 # target_link_libraries(${PROJECT_NAME}_node
 #   ${catkin_LIBRARIES}
 # )
+target_link_libraries(bounding_boxes_to_world_coordinates_node
+    ${catkin_LIBRARIES}
+    ${OpenCV_LIBRARIES}
+)
+
+target_link_libraries(bounding_box_publisher_node
+    ${catkin_LIBRARIES}
+)
 
 #############
 ## Install ##

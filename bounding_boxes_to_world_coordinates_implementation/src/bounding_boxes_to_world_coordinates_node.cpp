@@ -1,0 +1,319 @@
+/*
+  This is the source code for the functionality of turning a bounding box for a detected object into real world coordinates
+  using the robot's localization (odometry or amcl) and the depth sensor of the camera. The logic expects the kinect's camera 
+  and depth sensor to be level with respect to the robot's base. Various #DEFINE statements were used to adjust/configure environmental
+  parameters e.g the kinect's FOV on the horizontal and vertical axes, these may and should be adjusted accordingly.
+*/
+
+#include <ros/ros.h>
+#include <image_transport/image_transport.h>
+#include <image_transport/subscriber_filter.h>
+#include <cv_bridge/cv_bridge.h>
+#include <sensor_msgs/image_encodings.h>
+#include <sensor_msgs/Image.h>
+#include <nav_msgs/Odometry.h>
+#include <geometry_msgs/Quaternion.h>
+#include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/approximate_time.h>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
+
+// Custom msgs
+#include <bounding_boxes_to_world_coordinates_msgs/bounding_box.h>
+#include <bounding_boxes_to_world_coordinates_msgs/bounding_box_collection.h>
+
+#include <cmath>
+#include <iostream>
+
+// Node template
+#include "node_template.cpp"
+
+// Define Infinite (Using INT_MAX caused overflow problems)
+#define INF 10000
+
+// Define topics for publishers and subscribers
+#define BOUNDING_BOX_SUB_TOPIC "/bounding_box/collection"
+#define BOUNDING_BOX_PUB_TOPIC "/bounding_box/collection_with_world_coordinates"
+#define ODOMETRY_SUB_TOPIC "husky_base_ground_truth"
+
+/* Sources online mention that a real kinect V1 (old kinect) has a resolution of 640x480,
+  and the fov's are 62 degrees horizontally and 48.6 degrees vertically, resulting in 
+  10.322580645 x 9.87654321 pixels per degree (roughly 10 x 10). 
+*/
+#define REAL_KINECT_V1_HORIZONTAL_FOV 62
+#define REAL_KINECT_V1_VERTICAL_FOV 48.6
+
+/* Found by searching for the kinect_camera.urdf.xacro file in husky/husky_description/urdf/accessories, the horizontal FOV is 70 degrees 
+  <horizontal_fov>${70.0*M_PI/180.0}</horizontal_fov>
+*/
+#define KINECT_CAMERA_HORIZONTAL_FOV_DEG 70
+
+/* Since the kinect_camera.urdf.xacro file has no mention of the vertical fov, we set it ourselves.
+  By changing the horizontal fov in the the kinect_camera.urdf.xacro, the vertical fov seems to change as well.
+  Taking for granted that the ratio of horizontal_fov/vertical_fov remains constant, as well as trusting the source mentioning the
+  horizontal and vertical fov's  online, the calculated vertical fov is:
+*/
+#define KINECT_CAMERA_VERTICAL_FOV_DEG KINECT_CAMERA_HORIZONTAL_FOV_DEG * REAL_KINECT_V1_VERTICAL_FOV / REAL_KINECT_V1_HORIZONTAL_FOV
+
+#define INVALID_DISTANCE -1.0
+
+#define KINECT_CAMERA_WIDTH 640
+#define KINECT_CAMERA_HEIGHT 480
+
+// Class Definition
+class BoundingBoxesToWorldCoordinates
+{
+private:
+  ros::NodeHandle nh_;
+  ros::NodeHandle pnh_;
+  image_transport::ImageTransport it_;
+  image_transport::Subscriber image_sub_;
+  image_transport::Publisher image_pub_;
+  image_transport::SubscriberFilter depth_image_sub_;
+  message_filters::Subscriber<bounding_boxes_to_world_coordinates_msgs::bounding_box_collection> bounding_box_collection_sub_;
+  message_filters::Subscriber<nav_msgs::Odometry> odometry_sub_;
+  ros::Publisher bounding_box_collection_pub_;
+
+  typedef union U_FloatParse
+  {
+    float float_data;
+    unsigned char byte_data[4];
+  } U_FloatConvert;
+
+  int readDepthData(cv::Point2i, sensor_msgs::ImageConstPtr depth_image);
+  double findAngleInRadiansFromCameraPointOfReference(cv::Point2i, char axis);
+  double findAngleInRadiansFromQuaternion(geometry_msgs::Quaternion &quaternion);
+
+  bool findPositionOfObjectInWorld(
+      double &distance,
+      double &object_angle_radians,
+      double &robot_angle_radians,
+      double robot_position_x,
+      double robot_position_y,
+      double &object_position_x,
+      double &object_position_y);
+
+  bool intersection(cv::Point2i o1, cv::Point2i p1, cv::Point2i o2, cv::Point2i p2, cv::Point2i &r);
+
+public:
+  BoundingBoxesToWorldCoordinates();
+  BoundingBoxesToWorldCoordinates(ros::NodeHandle, ros::NodeHandle);
+  ~BoundingBoxesToWorldCoordinates();
+
+  void callBack(
+      const bounding_boxes_to_world_coordinates_msgs::bounding_box_collectionConstPtr &bounding_box_collection,
+      const sensor_msgs::ImageConstPtr &image,
+      const nav_msgs::OdometryConstPtr &odometry);
+};
+
+// Constructor
+BoundingBoxesToWorldCoordinates::BoundingBoxesToWorldCoordinates(ros::NodeHandle nh, ros::NodeHandle pnh)
+    : nh_(nh), pnh_(pnh_), it_(nh_), depth_image_sub_(it_, "camera/depth/image_raw", 1)
+{
+  bounding_box_collection_sub_.subscribe(nh_, BOUNDING_BOX_SUB_TOPIC, 1);
+  odometry_sub_.subscribe(nh_, ODOMETRY_SUB_TOPIC, 1);
+  bounding_box_collection_pub_ = nh_.advertise<bounding_boxes_to_world_coordinates_msgs::bounding_box_collection>(BOUNDING_BOX_PUB_TOPIC, 1);
+  typedef message_filters::sync_policies::ApproximateTime<bounding_boxes_to_world_coordinates_msgs::bounding_box_collection, sensor_msgs::Image, nav_msgs::Odometry> MySyncPolicy;
+  message_filters::Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), bounding_box_collection_sub_, depth_image_sub_, odometry_sub_);
+  sync.registerCallback(boost::bind(&BoundingBoxesToWorldCoordinates::callBack, this, _1, _2, _3));
+  ros::spin();
+}
+
+BoundingBoxesToWorldCoordinates::~BoundingBoxesToWorldCoordinates()
+{
+}
+
+int BoundingBoxesToWorldCoordinates::readDepthData(cv::Point2i intersection_point, sensor_msgs::ImageConstPtr depth_image)
+{
+  // If position is invalid
+  if ((intersection_point.y >= depth_image->height) || (intersection_point.x >= depth_image->width))
+    return INVALID_DISTANCE;
+  int index = (intersection_point.y * depth_image->step) + (intersection_point.x * (depth_image->step / depth_image->width));
+  // If data is 4 byte floats (rectified depth image)
+  if ((depth_image->step / depth_image->width) == 4)
+  {
+    U_FloatConvert depth_data;
+    int i, endian_check = 1;
+    // If big endian
+    if ((depth_image->is_bigendian && (*(char *)&endian_check != 1)) ||  // Both big endian
+        ((!depth_image->is_bigendian) && (*(char *)&endian_check == 1))) // Both lil endian
+    {
+      for (i = 0; i < 4; i++)
+        depth_data.byte_data[i] = depth_image->data[index + i];
+      // Make sure data is valid (check if NaN)
+      if (depth_data.float_data == depth_data.float_data)
+        return int(depth_data.float_data * 1000);
+      return INVALID_DISTANCE; // If depth data invalid
+    }
+    // else, one little endian, one big endian
+    for (i = 0; i < 4; i++)
+      depth_data.byte_data[i] = depth_image->data[3 + index - i];
+    // Make sure data is valid (check if NaN)
+    if (depth_data.float_data == depth_data.float_data)
+      return int(depth_data.float_data * 1000);
+    return INVALID_DISTANCE; // If depth data invalid
+  }
+  // Otherwise, data is 2 byte integers (raw depth image)
+  int temp_val;
+  // If big endian
+  if (depth_image->is_bigendian)
+    temp_val = (depth_image->data[index] << 8) + depth_image->data[index + 1];
+  // If little endian
+  else
+    temp_val = depth_image->data[index] + (depth_image->data[index + 1] << 8);
+  // Make sure data is valid (check if NaN)
+  if (temp_val == temp_val)
+    return temp_val;
+  return INVALID_DISTANCE; // If depth data invalid
+}
+
+double BoundingBoxesToWorldCoordinates::findAngleInRadiansFromCameraPointOfReference(cv::Point2i intersection_point, char axis)
+{
+  double angleInRadians = 0.0;
+  cv::Point2i middle_pixel(KINECT_CAMERA_WIDTH / 2, KINECT_CAMERA_HEIGHT / 2);
+  if (axis == 'H') {
+  double degrees_per_pixel = (double)KINECT_CAMERA_HORIZONTAL_FOV_DEG / (double)KINECT_CAMERA_WIDTH;
+  angleInRadians = (degrees_per_pixel * (middle_pixel.x - intersection_point.x)) * M_PI / 180;
+  } else if (axis == 'V') {
+    double degrees_per_pixel = (double)KINECT_CAMERA_VERTICAL_FOV_DEG / (double)KINECT_CAMERA_HEIGHT;
+    angleInRadians = (degrees_per_pixel * (middle_pixel.y - intersection_point.y)) * M_PI / 180;
+  }
+  return angleInRadians;
+}
+
+bool BoundingBoxesToWorldCoordinates::findPositionOfObjectInWorld(
+    double &distance_mm,
+    double &object_angle_radians,
+    double &robot_angle_radians,
+    double robot_position_x,
+    double robot_position_y,
+    double &object_position_x,
+    double &object_position_y)
+{
+  if (distance_mm != -1.0)
+  {
+    double consolidated_angle_radians = robot_angle_radians + object_angle_radians;
+    object_position_x = robot_position_x + distance_mm / 1000 * cos(consolidated_angle_radians);
+    object_position_y = robot_position_y + distance_mm / 1000 * sin(consolidated_angle_radians);
+    return true;
+  }
+  return false;
+}
+
+double BoundingBoxesToWorldCoordinates::findAngleInRadiansFromQuaternion(geometry_msgs::Quaternion &quaternion)
+{
+  tf2::Quaternion q(
+      quaternion.x,
+      quaternion.y,
+      quaternion.z,
+      quaternion.w);
+  tf2::Matrix3x3 m(q);
+  double roll, pitch, yaw;
+  m.getRPY(roll, pitch, yaw);
+  return yaw;
+}
+
+// Finds the intersection of two lines, or returns false.
+// The lines are defined by (o1, p1) and (o2, p2).
+bool BoundingBoxesToWorldCoordinates::intersection(cv::Point2i o1, cv::Point2i p1, cv::Point2i o2, cv::Point2i p2, cv::Point2i &r)
+{
+  cv::Point2i x = o2 - o1;
+  cv::Point2i d1 = p1 - o1;
+  cv::Point2i d2 = p2 - o2;
+
+  float cross = d1.x * d2.y - d1.y * d2.x;
+  if (abs(cross) < /*EPS*/ 1e-8)
+    return false;
+
+  double t1 = (x.x * d2.y - x.y * d2.x) / cross;
+  r = o1 + d1 * t1;
+  return true;
+}
+
+void BoundingBoxesToWorldCoordinates::callBack(
+    const bounding_boxes_to_world_coordinates_msgs::bounding_box_collectionConstPtr &bounding_box_collection,
+    const sensor_msgs::ImageConstPtr &image,
+    const nav_msgs::OdometryConstPtr &odometry)
+{
+  cv_bridge::CvImagePtr cv_ptr;
+  try
+  {
+    cv_ptr = cv_bridge::toCvCopy(image, sensor_msgs::image_encodings::TYPE_32FC1);
+  }
+  catch (cv_bridge::Exception &e)
+  {
+    ROS_ERROR("cv_bridge exception: %s", e.what());
+    return;
+  }
+
+  // Set robot angle
+  geometry_msgs::Quaternion temp_quaternion = odometry->pose.pose.orientation;
+  double robot_angle = findAngleInRadiansFromQuaternion(temp_quaternion);
+  
+  bounding_boxes_to_world_coordinates_msgs::bounding_box_collection bounding_box_collection_new;
+
+  bounding_boxes_to_world_coordinates_msgs::bounding_box_collection bounding_box_collection_with_world_coords;
+  // For each bounding box [0...n]:
+  for (unsigned long int i = 0; i < bounding_box_collection->bounding_box.size(); i++)
+  {
+    bounding_boxes_to_world_coordinates_msgs::bounding_box bounding_box_temp = bounding_box_collection->bounding_box[i];
+
+        // Generate the four corners of the bounding box according to the upper_left_corner_x, upper_left_corner_y, 
+    cv::Point2i bounding_box_points[4];
+    bounding_box_points[0].x = bounding_box_collection->bounding_box[i].upper_left_corner_x;
+    bounding_box_points[0].y = bounding_box_collection->bounding_box[i].upper_left_corner_y;
+
+    bounding_box_points[1].x = bounding_box_collection->bounding_box[i].upper_left_corner_x + bounding_box_collection->bounding_box[i].bounding_box_width;
+    bounding_box_points[1].y = bounding_box_collection->bounding_box[i].upper_left_corner_y;
+
+    bounding_box_points[2].x = bounding_box_collection->bounding_box[i].upper_left_corner_x + bounding_box_collection->bounding_box[i].bounding_box_width;
+    bounding_box_points[2].y = bounding_box_collection->bounding_box[i].upper_left_corner_y + bounding_box_collection->bounding_box[i].bounding_box_height;
+
+    bounding_box_points[3].x = bounding_box_collection->bounding_box[i].upper_left_corner_x;
+    bounding_box_points[3].y = bounding_box_collection->bounding_box[i].upper_left_corner_y + bounding_box_collection->bounding_box[i].bounding_box_height;
+    
+    cv::Point2i intersection_point;
+    // If the four corners of the bounding box intersect:
+    if (intersection(bounding_box_points[0], bounding_box_points[2], bounding_box_points[1], bounding_box_points[3], intersection_point))
+    {
+      // Write the depth data
+      double distance_mm = readDepthData(intersection_point, image);
+
+      // If distance is a valid value
+      if (distance_mm != INVALID_DISTANCE) {
+        // Find the distance from the sensor to the point if we perceive only a 2d space, 
+        // given that the distance_mm is the hypotenuse of a right triangle, and the distance we care for is the adjacent side of it
+        distance_mm = distance_mm / cos(findAngleInRadiansFromCameraPointOfReference(intersection_point, 'V'));
+      }
+    
+      // Write the angle in radians
+      double object_angle_radians = findAngleInRadiansFromCameraPointOfReference(intersection_point, 'H');
+
+      double object_world_x, object_world_y;
+      // Find marker position in world
+      if (findPositionOfObjectInWorld(
+              distance_mm,
+              object_angle_radians,
+              robot_angle,
+              odometry->pose.pose.position.x,
+              odometry->pose.pose.position.y,
+              object_world_x,
+              object_world_y))
+      {
+        bounding_box_temp.world_x = object_world_x;
+        bounding_box_temp.world_y = object_world_y;
+      }
+      bounding_box_collection_new.bounding_box.push_back(bounding_box_temp);
+    }
+  }
+
+  bounding_box_collection_pub_.publish(bounding_box_collection_new);
+}
+
+int main(int argc, char **argv)
+{
+  NodeMain<BoundingBoxesToWorldCoordinates>(argc, argv, "BoundingBoxesToWorldCoordinatesNode");
+}
